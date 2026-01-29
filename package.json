@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-draiven",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "n8n node for Draiven AI integration",
   "keywords": [
     "n8n-community-node-package",
