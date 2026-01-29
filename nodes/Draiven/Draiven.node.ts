@@ -62,7 +62,7 @@ export class Draiven implements INodeType {
 			},
 			// Persona Selection
 			{
-				displayName: 'Persona',
+				displayName: 'Persona Name or ID',
 				name: 'persona',
 				type: 'options',
 				typeOptions: {
@@ -132,7 +132,8 @@ export class Draiven implements INodeType {
 			// Load available datasets from Draiven API
 			async getDatasets(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
 				const credentials = await this.getCredentials('draivenApi');
-				const apiUrl = credentials.apiUrl as string;
+				// Remove trailing slash from API URL to avoid FastAPI redirects
+				const apiUrl = (credentials.apiUrl as string).replace(/\/$/, '');
 				const userEmail = credentials.userEmail as string;
 				const apiKey = credentials.apiKey as string;
 
@@ -148,6 +149,8 @@ export class Draiven implements INodeType {
 							'Content-Type': 'application/json',
 						},
 						json: true,
+						followRedirect: true,
+						maxRedirects: 5,
 					});
 
 					// Map datasets to n8n options format
@@ -165,7 +168,8 @@ export class Draiven implements INodeType {
 			// Load available personas from Draiven API
 			async getPersonas(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
 				const credentials = await this.getCredentials('draivenApi');
-				const apiUrl = credentials.apiUrl as string;
+				// Remove trailing slash from API URL to avoid FastAPI redirects
+				const apiUrl = (credentials.apiUrl as string).replace(/\/$/, '');
 				const userEmail = credentials.userEmail as string;
 				const apiKey = credentials.apiKey as string;
 
@@ -181,6 +185,8 @@ export class Draiven implements INodeType {
 							'Content-Type': 'application/json',
 						},
 						json: true,
+						followRedirect: true,
+						maxRedirects: 5,
 					});
 
 					// Map personas to n8n options format
@@ -202,7 +208,8 @@ export class Draiven implements INodeType {
 		const returnData: INodeExecutionData[] = [];
 
 		const credentials = await this.getCredentials('draivenApi');
-		const apiUrl = credentials.apiUrl as string;
+		// Remove trailing slash from API URL to avoid FastAPI redirects
+		const apiUrl = (credentials.apiUrl as string).replace(/\/$/, '');
 		const userEmail = credentials.userEmail as string;
 		const apiKey = credentials.apiKey as string;
 
@@ -241,13 +248,15 @@ export class Draiven implements INodeType {
 					// Make API call to Draiven
 					const response = await this.helpers.request({
 						method: 'POST',
-						url: `${apiUrl}/conversations`,
+						url: `${apiUrl}/conversations/`,
 						headers: {
 							'Authorization': `Basic ${authString}`,
 							'Content-Type': 'application/json',
 						},
 						body: requestBody,
 						json: true,
+						followRedirect: true,
+						maxRedirects: 5,
 					});
 
 					// Add response to return data
