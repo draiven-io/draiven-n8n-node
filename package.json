@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-draiven",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "n8n node for Draiven AI integration",
   "keywords": [
     "n8n-community-node-package",
@@ -39,6 +39,9 @@
     "nodes": [
       "dist/nodes/Draiven/Draiven.node.js"
     ]
+  },
+  "dependencies": {
+    "@microsoft/signalr": "^8.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

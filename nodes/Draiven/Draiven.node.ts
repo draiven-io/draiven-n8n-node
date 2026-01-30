@@ -7,6 +7,8 @@ import {
 	INodePropertyOptions,
 } from 'n8n-workflow';
 
+import * as signalR from '@microsoft/signalr';
+
 export class Draiven implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Draiven',
@@ -230,47 +232,119 @@ export class Draiven implements INodeType {
 						stream?: boolean;
 					};
 
-					// Prepare request body
+					// Step 1: Negotiate SignalR connection
+					const negotiateResponse = await this.helpers.request({
+						method: 'POST',
+						url: `${apiUrl}/signalr/negotiate`,
+						headers: {
+							'Authorization': `Basic ${authString}`,
+							'Content-Type': 'application/json',
+						},
+						json: true,
+					});
+
+					const { url: signalrUrl, accessToken } = negotiateResponse;
+
+					// Step 2: Create SignalR connection
+					const connection = new signalR.HubConnectionBuilder()
+						.withUrl(signalrUrl, {
+							accessTokenFactory: () => accessToken,
+						})
+						.withAutomaticReconnect()
+						.configureLogging(signalR.LogLevel.Warning)
+						.build();
+
+					// Step 3: Set up message handlers and promise for completion
+					const responsePromise = new Promise<any>((resolve, reject) => {
+						const streamedMessages: any[] = [];
+						let finalResponse: any = null;
+						const timeout = setTimeout(() => {
+							reject(new Error('SignalR response timeout after 5 minutes'));
+						}, 300000); // 5 minutes timeout
+
+						// Listen for all streaming events (progress, stage updates, etc.)
+						const eventTypes = [
+							'agent_start', 'agent_progress', 'agent_complete',
+							'stage_start', 'stage_update', 'stage_complete',
+							'tool_start', 'tool_progress', 'tool_complete',
+							'on_chain_start', 'on_chain_end',
+							'on_chat_model_start', 'on_chat_model_stream', 'on_chat_model_end'
+						];
+
+						// Subscribe to all event types
+						eventTypes.forEach(eventType => {
+							connection.on(eventType, (data: any) => {
+								streamedMessages.push({ type: eventType, ...data });
+							});
+						});
+
+						// Listen for completion event (this is when orchestration finishes)
+						connection.on('completion', (data: any) => {
+							finalResponse = data;
+							clearTimeout(timeout);
+							resolve({
+								final: finalResponse,
+								stream: streamedMessages,
+							});
+						});
+
+						// Listen for errors
+						connection.on('error', (error: any) => {
+							clearTimeout(timeout);
+							reject(new Error(error.message || 'SignalR error occurred'));
+						});
+					});
+
+					// Step 4: Start connection
+					await connection.start();
+
+					// Step 5: Send chat request (returns immediately with IDs)
 					const requestBody: any = {
 						question,
 						dataset_ids: datasets,
 						persona_id: personaId,
 					};
 
-					// Add optional parameters
 					if (additionalOptions.conversationId) {
 						requestBody.conversation_id = additionalOptions.conversationId;
 					}
-					if (additionalOptions.stream !== undefined) {
-						requestBody.stream = additionalOptions.stream;
-					}
 
-					// Make API call to Draiven
-					const response = await this.helpers.request({
+					const chatResponse = await this.helpers.request({
 						method: 'POST',
-						url: `${apiUrl}/conversations/`,
+						url: `${apiUrl}/signalr/chat`,
 						headers: {
 							'Authorization': `Basic ${authString}`,
 							'Content-Type': 'application/json',
 						},
 						body: requestBody,
 						json: true,
-						followRedirect: true,
-						maxRedirects: 5,
 					});
 
-					// Add response to return data
+					const { id: conversationId, execution_id: executionId } = chatResponse;
+
+					// Step 6: Wait for final response via SignalR
+					const result = await responsePromise;
+
+					// Step 7: Close connection
+					await connection.stop();
+
+					// Step 8: Format and return response
+					const finalData = result.final || {};
 					returnData.push({
 						json: {
 							success: true,
-							conversationId: response.conversation_id || response.id,
+							conversationId,
+							executionId,
 							question,
-							answer: response.answer || response.message || response.content,
+							answer: finalData.content || finalData.answer || finalData.message,
 							datasets,
 							personaId,
+							payload: finalData.payload,
+							echarts: finalData.echarts,
+							streamEvents: result.stream,
 							metadata: {
 								timestamp: new Date().toISOString(),
-								...response,
+								...finalData,
 							},
 						},
 					});
