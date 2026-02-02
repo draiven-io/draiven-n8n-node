@@ -124,6 +124,13 @@ export class Draiven implements INodeType {
 						default: false,
 						description: 'Whether to stream the response (returns final result only)',
 					},
+					{
+						displayName: 'Include Full Event Stream',
+						name: 'includeFullStream',
+						type: 'boolean',
+						default: false,
+						description: 'Whether to include all streaming events in output (useful for debugging)',
+					},
 				],
 			},
 		],
@@ -230,6 +237,7 @@ export class Draiven implements INodeType {
 					const additionalOptions = this.getNodeParameter('additionalOptions', i) as {
 						conversationId?: string;
 						stream?: boolean;
+						includeFullStream?: boolean;
 					};
 
 					// Step 1: Negotiate SignalR connection
@@ -275,6 +283,15 @@ export class Draiven implements INodeType {
 						eventTypes.forEach(eventType => {
 							connection.on(eventType, (data: any) => {
 								streamedMessages.push({ type: eventType, ...data });
+								
+								// Log progress updates for visibility in n8n console
+								if (eventType === 'agent_progress' && data.message) {
+									console.log(`[Draiven] ${data.message}`);
+								} else if (eventType === 'stage_start' && data.stage) {
+									console.log(`[Draiven] Starting: ${data.stage}`);
+								} else if (eventType === 'stage_complete' && data.stage) {
+									console.log(`[Draiven] ✓ Completed: ${data.stage}`);
+								}
 							});
 						});
 
@@ -330,24 +347,42 @@ export class Draiven implements INodeType {
 
 					// Step 8: Format and return response
 					const finalData = result.final || {};
-					returnData.push({
-						json: {
-							success: true,
-							conversationId,
-							executionId,
-							question,
-							answer: finalData.content || finalData.answer || finalData.message,
-							datasets,
-							personaId,
-							payload: finalData.payload,
-							echarts: finalData.echarts,
-							streamEvents: result.stream,
-							metadata: {
-								timestamp: new Date().toISOString(),
-								...finalData,
-							},
+					
+					// Create a summary of progress events for easy viewing
+					const progressSummary = result.stream
+						.filter((e: any) => e.type === 'agent_progress' || e.type === 'stage_start' || e.type === 'stage_complete')
+						.map((e: any) => ({
+							type: e.type,
+							stage: e.stage,
+							message: e.message,
+							timestamp: e.timestamp,
+							progress: e.progress
+						}));
+					
+					const outputData: any = {
+						success: true,
+						conversationId,
+						executionId,
+						question,
+						answer: finalData.content || finalData.answer || finalData.message,
+						datasets,
+						personaId,
+						payload: finalData.payload,
+						echarts: finalData.echarts,
+						progressSummary,  // Easy-to-read progress
+						metadata: {
+							timestamp: new Date().toISOString(),
+							totalEvents: result.stream.length,
+							...finalData,
 						},
-					});
+					};
+					
+					// Optionally include full stream events
+					if (additionalOptions.includeFullStream) {
+						outputData.streamEvents = result.stream;
+					}
+					
+					returnData.push({ json: outputData });
 				}
 			} catch (error) {
 				if (this.continueOnFail()) {
