@@ -370,7 +370,7 @@ describe('Draiven node loadOptions', () => {
 			expect(thrown.message).toMatch(context);
 		});
 
-	it('rejects an invalid API URL before calling the API', async () => {
+		it('rejects an invalid API URL before calling the API', async () => {
 			const request = jest.fn();
 
 			await expect(load(request, { apiUrl: 'not-a-url' })).rejects.toThrow(/not a valid URL/i);
