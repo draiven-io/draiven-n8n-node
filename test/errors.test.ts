@@ -7,6 +7,7 @@ import {
 	toDraivenError,
 } from '../nodes/Draiven/GenericFunctions';
 import {
+	AUTH_HEADER,
 	CREDENTIAL_SECRET,
 	ERROR_SHAPES,
 	httpError,
@@ -100,7 +101,8 @@ describe('toDraivenError', () => {
 		it.each(ERROR_SHAPES)('keeps the auth header off the error it returns (%s)', (shape) => {
 			const result = toDraivenError(node, httpError(401, 'Request failed', shape), 'submitting the question');
 
-			expect(reachableText(result)).not.toContain(CREDENTIAL_SECRET);
+			expect(reachableText(result)).not.toContain(AUTH_HEADER);
+			expect(reachableText(result)).not.toMatch(/Basic [A-Za-z0-9+/=]{10,}/);
 			expect(JSON.stringify(result)).not.toContain(CREDENTIAL_SECRET);
 		});
 
@@ -113,13 +115,14 @@ describe('toDraivenError', () => {
 				message: 'Unauthorized',
 				config: {
 					url: 'https://api.draiven.io/conversations/',
-					headers: { Authorization: `Basic ${CREDENTIAL_SECRET}` },
+					headers: { Authorization: AUTH_HEADER },
 				},
 			};
 
 			const result = toDraivenError(node, plainRejection, 'submitting the question');
 
-			expect(reachableText(result)).not.toContain(CREDENTIAL_SECRET);
+			expect(reachableText(result)).not.toContain(AUTH_HEADER);
+			expect(reachableText(result)).not.toMatch(/Basic [A-Za-z0-9+/=]{10,}/);
 		});
 	});
 });

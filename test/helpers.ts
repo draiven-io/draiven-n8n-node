@@ -11,7 +11,7 @@ export const BASE_URL = 'https://api.draiven.io';
  * never survives into anything the operator or the logs can see.
  */
 export const CREDENTIAL_SECRET = 'super-secret-api-key';
-const AUTH_HEADER = `Basic ${Buffer.from(`user@example.com:${CREDENTIAL_SECRET}`).toString('base64')}`;
+export const AUTH_HEADER = `Basic ${Buffer.from(`user@example.com:${CREDENTIAL_SECRET}`).toString('base64')}`;
 
 /**
  * The two shapes an error can have by the time node code sees it.
@@ -58,7 +58,17 @@ export function httpError(status: number, message = 'Request failed', shape: Err
 	};
 
 	if (shape === 'raw') return error;
-	return new NodeApiError(makeNode(), error as unknown as JsonObject);
+	return new NodeApiError(makeNode(), {
+		message,
+		isAxiosError: true,
+		statusCode: status,
+		status,
+		response: { status, statusCode: status, data: { detail: message } },
+		config: {
+			url: `${BASE_URL}/conversations/`,
+			headers: { Authorization: AUTH_HEADER },
+		},
+	} as JsonObject);
 }
 
 /** A transport-level failure, which carries no HTTP status. */

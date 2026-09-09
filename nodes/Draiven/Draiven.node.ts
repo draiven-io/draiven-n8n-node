@@ -52,11 +52,12 @@ function readIntegerOption(
 	const parsed = typeof value === 'string' ? Number(value.trim()) : value;
 
 	if (typeof parsed !== 'number' || !Number.isInteger(parsed) || parsed < config.min) {
+		const received = JSON.stringify(value);
 		throw new NodeOperationError(
 			node,
-			`The "${config.name}" option must be a whole number of at least ${config.min}.`,
+			`The "${config.name}" option must be a whole number of at least ${config.min}. Received ${received}.`,
 			{
-				description: `Received ${JSON.stringify(value)}.`,
+				description: `Received ${received}.`,
 				itemIndex: config.itemIndex,
 			},
 		);
@@ -278,9 +279,15 @@ export class Draiven implements INodeType {
 					});
 				}
 
-				const datasetIds = (this.getNodeParameter('datasetIds', i, []) as Array<number | string>)
-					.map((id) => Number(id))
-					.filter((id) => Number.isFinite(id));
+				const datasetIds = (this.getNodeParameter('datasetIds', i, []) as Array<number | string>).map(
+					(raw, index) =>
+						readIntegerOption(node, raw, {
+							name: `Dataset ID at position ${index + 1}`,
+							min: 1,
+							fallback: 0,
+							itemIndex: i,
+						}),
+				);
 				const rawAgentId = this.getNodeParameter('agentId', i, '') as number | string;
 				const options = this.getNodeParameter('options', i, {}) as AskQuestionOptions;
 

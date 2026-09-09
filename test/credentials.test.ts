@@ -56,6 +56,7 @@ describe('DraivenApi credential', () => {
 			['a query string', 'https://api.draiven.io/?debug=1', 'https://api.draiven.io'],
 			['a fragment', 'https://api.draiven.io/#frag', 'https://api.draiven.io'],
 			['http for self-hosting', 'http://localhost:8000', 'http://localhost:8000'],
+			['an uppercase HTTPS scheme', 'HTTPS://api.draiven.io', 'HTTPS://api.draiven.io'],
 		])('normalizes %s', (_label, input, expected) => {
 			expect(evaluateBaseUrl(input)).toBe(expected);
 		});

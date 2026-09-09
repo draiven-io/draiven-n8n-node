@@ -73,7 +73,7 @@ export class DraivenApi implements ICredentialType {
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL:
-				'={{ /^https?:\\/\\/(?![^\\/@]*@)[^\\/?#]+/.test(($credentials.apiUrl || "").trim()) ? ($credentials.apiUrl || "").trim().replace(/[?#].*$/, "").replace(/\\/+$/, "") : "" }}',
+				'={{ /^https?:\\/\\/(?![^\\/@]*@)[^\\/?#]+/i.test(($credentials.apiUrl || "").trim()) ? ($credentials.apiUrl || "").trim().replace(/[?#].*$/, "").replace(/\\/+$/, "") : "" }}',
 			url: '/ping',
 			method: 'GET',
 		},

@@ -196,6 +196,15 @@ describe('Draiven node execute', () => {
 		expect(request).not.toHaveBeenCalled();
 	});
 
+	it('rejects a non-numeric dataset ID instead of silently dropping it', async () => {
+		const request = jest.fn();
+
+		await expect(run(request, { ...baseParams, datasetIds: [4, 'sales', 7] })).rejects.toThrow(
+			/sales/,
+		);
+		expect(request).not.toHaveBeenCalled();
+	});
+
 	it('rejects an invalid API URL before calling the API', async () => {
 		const request = jest.fn();
 
