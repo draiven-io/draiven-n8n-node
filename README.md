@@ -21,34 +21,88 @@ After successful installation, the Draiven node will be available in your n8n in
 
 ### Ask Question
 
-Ask a question to Draiven AI using selected datasets and a specific persona.
+Ask a question to Draiven AI against one or more of your datasets, optionally routed to a specific agent.
+
+#### How it works
+
+Draiven answers questions asynchronously. The node:
+
+1. `POST`s the question to `/conversations/`, which returns a conversation ID immediately.
+2. Polls `/conversations/{id}/last-ai-message` until the assistant's answer appears.
+3. Returns the answer as a single item.
+
+The node blocks until the answer arrives or the timeout is reached, so downstream
+nodes always receive a completed answer rather than a pending job handle.
 
 #### Configuration
 
 1. **Credentials**: Set up your Draiven API credentials
-   - API URL: Your Draiven API endpoint (default: https://api.draiven.io)
-   - User Email: Your Draiven account email
-   - API Key: Your Draiven API key (create one in Settings > API Keys in your Draiven dashboard)
+   - **API URL**: Your Draiven API endpoint (for example `https://api.draiven.io`).
+     Must include the scheme; a trailing slash is optional.
+   - **User Email**: Your Draiven account email
+   - **API Key**: Your Draiven API key (create one in Settings > API Keys in your Draiven dashboard)
 
 2. **Parameters**:
-   - **Datasets**: Select one or more datasets to analyze
-   - **Persona**: Choose the AI persona to use (e.g., Data Detective, Sales Strategist, Finance Analyst)
-   - **Question**: Enter your question or analysis request
-   
+   - **Datasets** (required): One or more datasets to analyze
+   - **Agent** (optional): Route the question to a specific agent. Leave empty to
+     let Draiven choose.
+   - **Question** (required): Your question or analysis request
+
 3. **Additional Options**:
-   - **Conversation ID**: Continue an existing conversation
-   - **Stream Response**: Enable streaming for real-time responses
+   - **Conversation ID**: Continue an existing conversation instead of starting a new one
+   - **SQL Mode**: Ask Draiven to answer using SQL against the selected datasets
+   - **Timeout**: How long to wait for an answer, in seconds (default `300`)
+   - **Poll Interval**: How often to check for the answer, in seconds (default `2`,
+     minimum `2`)
 
 #### Output
 
 The node returns a JSON object with:
-- `success`: Boolean indicating if the operation succeeded
-- `conversationId`: ID of the conversation (for follow-up questions)
-- `question`: The question that was asked
-- `answer`: The AI's response
-- `datasets`: Array of dataset IDs used
-- `personaId`: ID of the persona used
-- `metadata`: Additional response metadata
+
+| Field | Description |
+| --- | --- |
+| `success` | Always `true` on the success path |
+| `conversationId` | Conversation ID — pass this to **Conversation ID** to follow up |
+| `executionId` | Backend execution identifier for the run |
+| `messageId` | ID of the assistant message that answered the question |
+| `question` | The question that was asked |
+| `answer` | The AI's response |
+| `contentType` | Format of `answer` (typically `html`) |
+| `additionalData` | Sources and other metadata attached to the answer |
+| `isConclusion` | Whether Draiven marked this message as the final answer |
+| `createdAt` | Timestamp of the answer |
+| `datasetIds` | Dataset IDs used |
+| `agentId` | Agent used, or `null` |
+| `sqlMode` | Whether SQL mode was requested |
+
+If **Continue On Fail** is enabled, failures produce `{ "success": false, "error": "..." }`
+for the affected item instead of stopping the workflow.
+
+#### Continuing a conversation
+
+Pass a previous run's `conversationId` into **Conversation ID**. The node records
+the conversation's existing answer before submitting, so it waits for the *new*
+answer rather than immediately returning the previous turn's response.
+
+## Known limitations
+
+### Draiven API tools are unavailable with API key authentication
+
+Draiven's orchestration can call back into the Draiven API on your behalf (for
+example to list or inspect datasets). Those tools require a user bearer token.
+Requests authenticated with an API key have no bearer token, so the backend skips
+registering the Draiven API tools for the run.
+
+**Impact**: questions answered through this node can analyze your dataset content
+normally, but cannot use the Draiven API tools. Questions that depend on them may
+return a less complete answer. Data analysis over the selected datasets is
+unaffected.
+
+### Timeouts do not cancel the run
+
+If the timeout is reached, the node fails but Draiven keeps processing. The error
+includes the conversation ID, and the answer can still be retrieved later from
+`/conversations/{id}/last-ai-message`, or by re-running with that **Conversation ID**.
 
 ## Credentials
 
@@ -61,6 +115,9 @@ To get your API credentials:
 3. Create a new API key
 4. Copy the API key and your account email
 5. Add them to the n8n credentials configuration
+
+Credentials are sent using HTTP Basic authentication and are handled entirely by
+n8n's credential system — the node never constructs or logs an authorization header.
 
 ## Compatibility
 
@@ -94,6 +151,9 @@ npm install
 # Build the node
 npm run build
 
+# Run the test suite
+npm test
+
 # Watch mode for development
 npm run dev
 ```
@@ -106,6 +166,20 @@ npm run dev
 4. Restart n8n
 
 ## Changelog
+
+### 0.3.0
+
+- **Breaking**: replaced the SignalR streaming flow with the Conversations REST API.
+  The **Stream Response** option was removed.
+- **Breaking**: replaced **Persona** selection with **Agent** selection, backed by
+  `GET /agents/`. Existing workflows must reselect an agent.
+- Output changed: `personaId` and `metadata` were replaced by `agentId`,
+  `additionalData`, `messageId`, `executionId`, `contentType`, `isConclusion`
+  and `createdAt`.
+- Added **SQL Mode**, **Timeout** and **Poll Interval** options.
+- Backend orchestration failures now fail the item instead of returning an error
+  string as the answer.
+- Removed the `@microsoft/signalr` dependency.
 
 ### 0.1.0 (2026-01-29)
 

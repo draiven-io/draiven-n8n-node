@@ -1,13 +1,34 @@
-import {
+import type {
+	IDataObject,
 	IExecuteFunctions,
+	ILoadOptionsFunctions,
 	INodeExecutionData,
+	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
-	ILoadOptionsFunctions,
-	INodePropertyOptions,
 } from 'n8n-workflow';
+import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
-import * as signalR from '@microsoft/signalr';
+import type { ConversationSubmitResponse } from './GenericFunctions';
+import {
+	draivenApiRequest,
+	fetchLastAiMessage,
+	getDraivenBaseUrl,
+	isErrorMessage,
+	MIN_POLL_INTERVAL_MS,
+	pollForAnswer,
+	toDraivenError,
+} from './GenericFunctions';
+
+interface AskQuestionOptions {
+	conversationId?: number;
+	pollInterval?: number;
+	sqlMode?: boolean;
+	timeout?: number;
+}
+
+const DEFAULT_TIMEOUT_SECONDS = 300;
+const DEFAULT_POLL_INTERVAL_SECONDS = 2;
 
 export class Draiven implements INodeType {
 	description: INodeTypeDescription = {
@@ -21,8 +42,8 @@ export class Draiven implements INodeType {
 		defaults: {
 			name: 'Draiven',
 		},
-		inputs: ['main'],
-		outputs: ['main'],
+		inputs: [NodeConnectionTypes.Main],
+		outputs: [NodeConnectionTypes.Main],
 		credentials: [
 			{
 				name: 'draivenApi',
@@ -39,47 +60,44 @@ export class Draiven implements INodeType {
 					{
 						name: 'Ask Question',
 						value: 'askQuestion',
-						description: 'Ask a question to Draiven AI with selected datasets and persona',
+						description: 'Ask a question to Draiven AI using selected datasets and an agent',
 						action: 'Ask a question to Draiven AI',
 					},
 				],
 				default: 'askQuestion',
 			},
-			// Datasets Selection
 			{
-				displayName: 'Datasets',
-				name: 'datasets',
+				displayName: 'Dataset Names or IDs',
+				name: 'datasetIds',
 				type: 'multiOptions',
 				typeOptions: {
 					loadOptionsMethod: 'getDatasets',
 				},
 				default: [],
-				required: true,
 				displayOptions: {
 					show: {
 						operation: ['askQuestion'],
 					},
 				},
-				description: 'Select one or more datasets to use for analysis',
+				description:
+					'Datasets to ground the answer on. Choose from the list, or specify IDs using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
 			},
-			// Persona Selection
 			{
-				displayName: 'Persona Name or ID',
-				name: 'persona',
+				displayName: 'Agent Name or ID',
+				name: 'agentId',
 				type: 'options',
 				typeOptions: {
-					loadOptionsMethod: 'getPersonas',
+					loadOptionsMethod: 'getAgents',
 				},
 				default: '',
-				required: true,
 				displayOptions: {
 					show: {
 						operation: ['askQuestion'],
 					},
 				},
-				description: 'Select the AI persona to use for this question',
+				description:
+					'Agent that answers the question. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
 			},
-			// Question Input
 			{
 				displayName: 'Question',
 				name: 'question',
@@ -97,10 +115,9 @@ export class Draiven implements INodeType {
 				description: 'The question you want to ask Draiven AI',
 				placeholder: 'What are the top 5 products by revenue this month?',
 			},
-			// Additional Options
 			{
-				displayName: 'Additional Options',
-				name: 'additionalOptions',
+				displayName: 'Options',
+				name: 'options',
 				type: 'collection',
 				placeholder: 'Add Option',
 				default: {},
@@ -113,23 +130,41 @@ export class Draiven implements INodeType {
 					{
 						displayName: 'Conversation ID',
 						name: 'conversationId',
-						type: 'string',
-						default: '',
-						description: 'Continue an existing conversation by providing its ID',
+						type: 'number',
+						default: 0,
+						typeOptions: {
+							minValue: 0,
+						},
+						description:
+							'Continue an existing conversation by its ID. Leave at 0 to start a new conversation.',
 					},
 					{
-						displayName: 'Stream Response',
-						name: 'stream',
-						type: 'boolean',
-						default: false,
-						description: 'Whether to stream the response (returns final result only)',
+						displayName: 'Poll Interval (Seconds)',
+						name: 'pollInterval',
+						type: 'number',
+						default: DEFAULT_POLL_INTERVAL_SECONDS,
+						typeOptions: {
+							minValue: 2,
+						},
+						description:
+							'How long to wait between checks for the answer. Values below 2 seconds are raised to 2 to limit request volume.',
 					},
 					{
-						displayName: 'Include Full Event Stream',
-						name: 'includeFullStream',
+						displayName: 'SQL Mode',
+						name: 'sqlMode',
 						type: 'boolean',
 						default: false,
-						description: 'Whether to include all streaming events in output (useful for debugging)',
+						description: 'Whether to run the question in SQL mode, bypassing the text-to-SQL step',
+					},
+					{
+						displayName: 'Timeout (Seconds)',
+						name: 'timeout',
+						type: 'number',
+						default: DEFAULT_TIMEOUT_SECONDS,
+						typeOptions: {
+							minValue: 1,
+						},
+						description: 'How long to wait for the answer before failing the node',
 					},
 				],
 			},
@@ -138,76 +173,42 @@ export class Draiven implements INodeType {
 
 	methods = {
 		loadOptions: {
-			// Load available datasets from Draiven API
 			async getDatasets(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
-				const credentials = await this.getCredentials('draivenApi');
-				// Remove trailing slash from API URL to avoid FastAPI redirects
-				const apiUrl = (credentials.apiUrl as string).replace(/\/$/, '');
-				const userEmail = credentials.userEmail as string;
-				const apiKey = credentials.apiKey as string;
+				const baseUrl = await getDraivenBaseUrl(this);
 
-				// Create Basic Auth header
-				const authString = Buffer.from(`${userEmail}:${apiKey}`).toString('base64');
-
+				let datasets: Array<{ id: number; name: string; description?: string; source_type?: string }>;
 				try {
-					const response = await this.helpers.request({
-						method: 'GET',
-						url: `${apiUrl}/datasets`,
-						headers: {
-							'Authorization': `Basic ${authString}`,
-							'Content-Type': 'application/json',
-						},
-						json: true,
-						followRedirect: true,
-						maxRedirects: 5,
-					});
-
-					// Map datasets to n8n options format
-					return response.map((dataset: any) => ({
-						name: dataset.name,
-						value: dataset.id,
-						description: dataset.description || `Type: ${dataset.source_type}`,
-					}));
+					datasets = await draivenApiRequest(this, 'GET', baseUrl, '/datasets/');
 				} catch (error) {
-					console.error('Error loading datasets:', error);
-					return [];
+					throw toDraivenError(this.getNode(), error, 'loading the dataset list');
 				}
+
+				if (!Array.isArray(datasets)) return [];
+
+				return datasets.map((dataset) => ({
+					name: dataset.name,
+					value: dataset.id,
+					description: dataset.description ?? undefined,
+				}));
 			},
 
-			// Load available personas from Draiven API
-			async getPersonas(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
-				const credentials = await this.getCredentials('draivenApi');
-				// Remove trailing slash from API URL to avoid FastAPI redirects
-				const apiUrl = (credentials.apiUrl as string).replace(/\/$/, '');
-				const userEmail = credentials.userEmail as string;
-				const apiKey = credentials.apiKey as string;
+			async getAgents(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const baseUrl = await getDraivenBaseUrl(this);
 
-				// Create Basic Auth header
-				const authString = Buffer.from(`${userEmail}:${apiKey}`).toString('base64');
-
+				let agents: Array<{ id: number; name: string; description?: string }>;
 				try {
-					const response = await this.helpers.request({
-						method: 'GET',
-						url: `${apiUrl}/personas`,
-						headers: {
-							'Authorization': `Basic ${authString}`,
-							'Content-Type': 'application/json',
-						},
-						json: true,
-						followRedirect: true,
-						maxRedirects: 5,
-					});
-
-					// Map personas to n8n options format
-					return response.map((persona: any) => ({
-						name: persona.name,
-						value: persona.id,
-						description: persona.description || '',
-					}));
+					agents = await draivenApiRequest(this, 'GET', baseUrl, '/agents/');
 				} catch (error) {
-					console.error('Error loading personas:', error);
-					return [];
+					throw toDraivenError(this.getNode(), error, 'loading the agent list');
 				}
+
+				if (!Array.isArray(agents)) return [];
+
+				return agents.map((agent) => ({
+					name: agent.name,
+					value: agent.id,
+					description: agent.description ?? undefined,
+				}));
 			},
 		},
 	};
@@ -215,183 +216,145 @@ export class Draiven implements INodeType {
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
-
-		const credentials = await this.getCredentials('draivenApi');
-		// Remove trailing slash from API URL to avoid FastAPI redirects
-		const apiUrl = (credentials.apiUrl as string).replace(/\/$/, '');
-		const userEmail = credentials.userEmail as string;
-		const apiKey = credentials.apiKey as string;
-
-		// Create Basic Auth header
-		const authString = Buffer.from(`${userEmail}:${apiKey}`).toString('base64');
+		const node = this.getNode();
 
 		for (let i = 0; i < items.length; i++) {
 			try {
 				const operation = this.getNodeParameter('operation', i) as string;
 
-				if (operation === 'askQuestion') {
-					// Get parameters
-					const datasets = this.getNodeParameter('datasets', i) as number[];
-					const personaId = this.getNodeParameter('persona', i) as number;
-					const question = this.getNodeParameter('question', i) as string;
-					const additionalOptions = this.getNodeParameter('additionalOptions', i) as {
-						conversationId?: string;
-						stream?: boolean;
-						includeFullStream?: boolean;
-					};
-
-					// Step 1: Negotiate SignalR connection
-					const negotiateResponse = await this.helpers.request({
-						method: 'POST',
-						url: `${apiUrl}/signalr/negotiate`,
-						headers: {
-							'Authorization': `Basic ${authString}`,
-							'Content-Type': 'application/json',
-						},
-						json: true,
+				if (operation !== 'askQuestion') {
+					throw new NodeOperationError(node, `The operation "${operation}" is not supported.`, {
+						itemIndex: i,
 					});
+				}
 
-					const { url: signalrUrl, accessToken } = negotiateResponse;
+				const baseUrl = await getDraivenBaseUrl(this);
 
-					// Step 2: Create SignalR connection
-					const connection = new signalR.HubConnectionBuilder()
-						.withUrl(signalrUrl, {
-							accessTokenFactory: () => accessToken,
-						})
-						.withAutomaticReconnect()
-						.configureLogging(signalR.LogLevel.Warning)
-						.build();
-
-					// Step 3: Set up message handlers and promise for completion
-					const responsePromise = new Promise<any>((resolve, reject) => {
-						const streamedMessages: any[] = [];
-						let finalResponse: any = null;
-						const timeout = setTimeout(() => {
-							reject(new Error('SignalR response timeout after 5 minutes'));
-						}, 300000); // 5 minutes timeout
-
-						// Listen for all streaming events (progress, stage updates, etc.)
-						const eventTypes = [
-							'agent_start', 'agent_progress', 'agent_complete',
-							'stage_start', 'stage_update', 'stage_complete',
-							'tool_start', 'tool_progress', 'tool_complete',
-							'on_chain_start', 'on_chain_end',
-							'on_chat_model_start', 'on_chat_model_stream', 'on_chat_model_end'
-						];
-
-						// Subscribe to all event types
-						eventTypes.forEach(eventType => {
-							connection.on(eventType, (data: any) => {
-								streamedMessages.push({ type: eventType, ...data });
-								
-								// Log progress updates for visibility in n8n console
-								if (eventType === 'agent_progress' && data.message) {
-									console.log(`[Draiven] ${data.message}`);
-								} else if (eventType === 'stage_start' && data.stage) {
-									console.log(`[Draiven] Starting: ${data.stage}`);
-								} else if (eventType === 'stage_complete' && data.stage) {
-									console.log(`[Draiven] ✓ Completed: ${data.stage}`);
-								}
-							});
-						});
-
-						// Listen for completion event (this is when orchestration finishes)
-						connection.on('completion', (data: any) => {
-							finalResponse = data;
-							clearTimeout(timeout);
-							resolve({
-								final: finalResponse,
-								stream: streamedMessages,
-							});
-						});
-
-						// Listen for errors
-						connection.on('error', (error: any) => {
-							clearTimeout(timeout);
-							reject(new Error(error.message || 'SignalR error occurred'));
-						});
+				const question = (this.getNodeParameter('question', i, '') as string).trim();
+				if (question === '') {
+					throw new NodeOperationError(node, 'The "Question" parameter is empty.', {
+						description: 'Provide a question to send to Draiven AI.',
+						itemIndex: i,
 					});
+				}
 
-					// Step 4: Start connection
-					await connection.start();
+				const datasetIds = (this.getNodeParameter('datasetIds', i, []) as Array<number | string>)
+					.map((id) => Number(id))
+					.filter((id) => Number.isFinite(id));
+				const rawAgentId = this.getNodeParameter('agentId', i, '') as number | string;
+				const options = this.getNodeParameter('options', i, {}) as AskQuestionOptions;
 
-					// Step 5: Send chat request (returns immediately with IDs)
-					const requestBody: any = {
-						question,
-						dataset_ids: datasets,
-						persona_id: personaId,
-					};
+				const timeoutMs = Math.max(options.timeout ?? DEFAULT_TIMEOUT_SECONDS, 1) * 1000;
+				const pollIntervalMs = Math.max(
+					(options.pollInterval ?? DEFAULT_POLL_INTERVAL_SECONDS) * 1000,
+					MIN_POLL_INTERVAL_MS,
+				);
 
-					if (additionalOptions.conversationId) {
-						requestBody.conversation_id = additionalOptions.conversationId;
+				const body: IDataObject = {
+					question,
+					dataset_ids: datasetIds,
+				};
+
+				const agentId = Number(rawAgentId);
+				if (rawAgentId !== '' && rawAgentId !== null && Number.isFinite(agentId)) {
+					body.agent_id = agentId;
+				}
+
+				if (options.sqlMode !== undefined) {
+					body.sql_mode = options.sqlMode;
+				}
+
+				// Continuing an existing conversation means its previous answer is
+				// already the "last AI message". Capture that id *before* submitting
+				// so the poll loop can tell the old answer from the new one.
+				const continuedConversationId =
+					typeof options.conversationId === 'number' && options.conversationId > 0
+						? options.conversationId
+						: undefined;
+
+				let baselineMessageId: number | null = null;
+				if (continuedConversationId !== undefined) {
+					body.conversation_id = continuedConversationId;
+					try {
+						const existing = await fetchLastAiMessage(this, baseUrl, continuedConversationId);
+						baselineMessageId = existing?.id ?? null;
+					} catch (error) {
+						throw toDraivenError(
+							node,
+							error,
+							`reading the current state of conversation ${continuedConversationId}`,
+						);
 					}
+				}
 
-					const chatResponse = await this.helpers.request({
-						method: 'POST',
-						url: `${apiUrl}/signalr/chat`,
-						headers: {
-							'Authorization': `Basic ${authString}`,
-							'Content-Type': 'application/json',
+				let submitted: ConversationSubmitResponse;
+				try {
+					submitted = await draivenApiRequest<ConversationSubmitResponse>(
+						this,
+						'POST',
+						baseUrl,
+						'/conversations/',
+						body,
+					);
+				} catch (error) {
+					throw toDraivenError(node, error, 'submitting the question to Draiven');
+				}
+
+				const conversationId = Number(submitted?.conversation_id ?? submitted?.id);
+				if (!Number.isFinite(conversationId)) {
+					throw new NodeOperationError(
+						node,
+						'Draiven accepted the question but returned no conversation ID.',
+						{
+							description: 'The answer cannot be polled without a conversation ID. Retry the request.',
+							itemIndex: i,
 						},
-						body: requestBody,
-						json: true,
+					);
+				}
+
+				const message = await pollForAnswer(this, baseUrl, {
+					conversationId,
+					timeoutMs,
+					pollIntervalMs,
+					baselineMessageId,
+				});
+
+				// The backend persists an assistant message flagged with
+				// `additional_data.error` so pollers stop waiting. It is a failure
+				// report, not an answer, and must not be returned as success.
+				if (isErrorMessage(message)) {
+					throw new NodeOperationError(node, 'Draiven failed to answer the question.', {
+						description: `The Draiven orchestration reported an error for conversation ${conversationId}. Backend message: "${message.content}"`,
+						itemIndex: i,
 					});
+				}
 
-					const { id: conversationId, execution_id: executionId } = chatResponse;
-
-					// Step 6: Wait for final response via SignalR
-					const result = await responsePromise;
-
-					// Step 7: Close connection
-					await connection.stop();
-
-					// Step 8: Format and return response
-					const finalData = result.final || {};
-					
-					// Create a summary of progress events for easy viewing
-					const progressSummary = result.stream
-						.filter((e: any) => e.type === 'agent_progress' || e.type === 'stage_start' || e.type === 'stage_complete')
-						.map((e: any) => ({
-							type: e.type,
-							stage: e.stage,
-							message: e.message,
-							timestamp: e.timestamp,
-							progress: e.progress
-						}));
-					
-					const outputData: any = {
+				returnData.push({
+					json: {
 						success: true,
 						conversationId,
-						executionId,
+						executionId: submitted.execution_id,
+						messageId: message.id,
 						question,
-						answer: finalData.content || finalData.answer || finalData.message,
-						datasets,
-						personaId,
-						payload: finalData.payload,
-						echarts: finalData.echarts,
-						progressSummary,  // Easy-to-read progress
-						metadata: {
-							timestamp: new Date().toISOString(),
-							totalEvents: result.stream.length,
-							...finalData,
-						},
-					};
-					
-					// Optionally include full stream events
-					if (additionalOptions.includeFullStream) {
-						outputData.streamEvents = result.stream;
-					}
-					
-					returnData.push({ json: outputData });
-				}
+						answer: message.content,
+						contentType: message.content_type ?? 'html',
+						additionalData: message.additional_data ?? null,
+						isConclusion: message.is_conclusion ?? false,
+						createdAt: message.created_at,
+						datasetIds,
+						agentId: body.agent_id ?? null,
+						sqlMode: body.sql_mode ?? false,
+					},
+					pairedItem: { item: i },
+				});
 			} catch (error) {
 				if (this.continueOnFail()) {
-					const errorMessage = error instanceof Error ? error.message : String(error);
 					returnData.push({
 						json: {
 							success: false,
-							error: errorMessage,
+							error: error instanceof Error ? error.message : String(error),
 						},
+						pairedItem: { item: i },
 					});
 					continue;
 				}

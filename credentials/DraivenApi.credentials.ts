@@ -16,7 +16,9 @@ export class DraivenApi implements ICredentialType {
 			type: 'string',
 			default: 'https://api.draiven.io',
 			required: true,
-			description: 'The base URL of the Draiven API',
+			placeholder: 'https://api.draiven.io',
+			description:
+				'The base URL of the Draiven API. Must include the scheme (http or https). A trailing slash is ignored.',
 		},
 		{
 			displayName: 'User Email',
@@ -51,10 +53,12 @@ export class DraivenApi implements ICredentialType {
 		},
 	};
 
-	// Test the credentials by making a simple API call
+	// Verify the credential against the public /ping endpoint. The trailing slash
+	// is stripped here so a base URL like "https://api.draiven.io/" cannot produce
+	// a double-slashed path that the backend answers with a redirect.
 	test: ICredentialTestRequest = {
 		request: {
-			baseURL: '={{$credentials.apiUrl}}',
+			baseURL: '={{$credentials.apiUrl.replace(/\\/+$/, "")}}',
 			url: '/ping',
 			method: 'GET',
 		},
