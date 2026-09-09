@@ -1,5 +1,13 @@
-import { pollForAnswer } from '../nodes/Draiven/GenericFunctions';
+import { DEFAULT_REQUEST_TIMEOUT_MS, pollForAnswer } from '../nodes/Draiven/GenericFunctions';
 import { aiMessage, BASE_URL, httpError, makeContext, networkError } from './helpers';
+
+/** The options object handed to `httpRequestWithAuthentication`. */
+type RequestOptions = { timeout: number; url: string };
+
+/** Read the request options from each recorded call. */
+function requestOptions(request: jest.Mock): RequestOptions[] {
+	return request.mock.calls.map((call) => call[1] as RequestOptions);
+}
 
 describe('pollForAnswer', () => {
 	beforeEach(() => {
@@ -143,5 +151,75 @@ describe('pollForAnswer', () => {
 
 		await jest.advanceTimersByTimeAsync(6000);
 		await assertion;
+	});
+
+	// Without a per-request timeout the node inherits the HTTP client's default,
+	// which is "wait forever". A single stalled socket then pins the workflow
+	// open indefinitely and the node's own timeout never gets to fire.
+	describe('request deadlines', () => {
+		it('bounds every poll request with a timeout', async () => {
+			const request = jest.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(aiMessage(2));
+
+			const promise = poll(request);
+			await jest.advanceTimersByTimeAsync(4000);
+			await promise;
+
+			expect(requestOptions(request)).not.toHaveLength(0);
+			for (const options of requestOptions(request)) {
+				expect(options.timeout).toBeGreaterThan(0);
+				expect(options.timeout).toBeLessThanOrEqual(DEFAULT_REQUEST_TIMEOUT_MS);
+			}
+		});
+
+		it('never lets one request outlive the remaining budget', async () => {
+			const request = jest.fn().mockResolvedValue(null);
+
+			const promise = poll(request, { timeoutMs: 5000 });
+			const assertion = expect(promise).rejects.toThrow(/did not return an answer/i);
+
+			await jest.advanceTimersByTimeAsync(6000);
+			await assertion;
+
+			for (const options of requestOptions(request)) {
+				expect(options.timeout).toBeLessThanOrEqual(5000);
+			}
+		});
+
+		// End-to-end proof that the timeout is not merely set but effective: the
+		// mock honours it the way a real client does, so a permanently stalled
+		// endpoint ends in the node's own timeout instead of hanging forever.
+		it('times out instead of hanging when every request stalls', async () => {
+			const request = jest.fn(
+				(_credentialType: string, options: RequestOptions) =>
+					new Promise((_resolve, reject) => {
+						// Model the client faithfully: given no usable timeout it
+						// waits forever, so omitting one hangs this test rather
+						// than quietly passing.
+						if (!Number.isFinite(options.timeout) || options.timeout <= 0) return;
+						setTimeout(() => reject(networkError('ETIMEDOUT')), options.timeout);
+					}),
+			);
+
+			const promise = poll(request as unknown as jest.Mock, { timeoutMs: 20_000 });
+			const assertion = expect(promise).rejects.toThrow(/did not return an answer within 20s/i);
+
+			await jest.advanceTimersByTimeAsync(120_000);
+			await assertion;
+		});
+	});
+
+	// With an uncapped doubling backoff and a 10s interval the waits become
+	// 20s, 40s, 80s, 160s, so the fifth attempt lands ~5 minutes out and the
+	// deadline always fires first -- the failure guard becomes dead code.
+	it('caps backoff so the consecutive-failure guard stays reachable', async () => {
+		const request = jest.fn().mockRejectedValue(httpError(502));
+
+		const promise = poll(request, { timeoutMs: 600_000, pollIntervalMs: 10_000 });
+		const assertion = expect(promise).rejects.toThrow(/consecutive transient failures/i);
+
+		await jest.advanceTimersByTimeAsync(200_000);
+		await assertion;
+
+		expect(request).toHaveBeenCalledTimes(5);
 	});
 });

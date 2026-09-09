@@ -4,6 +4,23 @@ This is an n8n community node that lets you use Draiven AI in your n8n workflows
 
 [Draiven](https://draiven.io) is a powerful AI-powered platform for data analysis and insights generation using advanced language models.
 
+## Upgrading to 0.3.0
+
+**0.3.0 is a breaking change.** Workflows built on 0.2.x will not run unchanged.
+
+After upgrading, open every workflow that uses this node and:
+
+1. **Reselect the agent.** **Persona** was replaced by **Agent Name or ID**, backed by
+   `GET /agents/`. The old persona selection does not carry over.
+2. **Remove references to the Stream Response option.** It no longer exists; answers
+   are always returned as a single completed item.
+3. **Update downstream field references.** `personaId` and `metadata` are gone.
+   Use `agentId` and `additionalData`; `messageId`, `executionId`, `contentType`,
+   `isConclusion` and `createdAt` are also now available.
+
+Re-test each workflow before relying on it — a node that looks configured may still
+be missing an agent selection.
+
 ## Installation
 
 Follow the [installation guide](https://docs.n8n.io/integrations/community-nodes/installation/) in the n8n community nodes documentation.
@@ -39,20 +56,30 @@ nodes always receive a completed answer rather than a pending job handle.
 1. **Credentials**: Set up your Draiven API credentials
    - **API URL**: Your Draiven API endpoint (for example `https://api.draiven.io`).
      Must include the scheme; a trailing slash is optional.
+
+     > **Use HTTPS.** Your email and API key are sent as HTTP Basic authentication
+     > on every request, which is only base64-encoded, not encrypted. An `http://`
+     > URL exposes your API key to anyone on the network path. Only use `http://`
+     > against a local development backend you control.
+
    - **User Email**: Your Draiven account email
    - **API Key**: Your Draiven API key (create one in Settings > API Keys in your Draiven dashboard)
 
 2. **Parameters**:
-   - **Datasets** (required): One or more datasets to analyze
-   - **Agent** (optional): Route the question to a specific agent. Leave empty to
+   - **Dataset Names or IDs**: One or more datasets to analyze. Optional — if you
+     select none, Draiven answers without dataset context, which is rarely what
+     you want.
+   - **Agent Name or ID**: Route the question to a specific agent. Leave empty to
      let Draiven choose.
    - **Question** (required): Your question or analysis request
 
 3. **Additional Options**:
-   - **Conversation ID**: Continue an existing conversation instead of starting a new one
+   - **Conversation ID**: Continue an existing conversation instead of starting a
+     new one. Must be a whole number; `0` starts a new conversation.
    - **SQL Mode**: Ask Draiven to answer using SQL against the selected datasets
-   - **Timeout**: How long to wait for an answer, in seconds (default `300`)
-   - **Poll Interval**: How often to check for the answer, in seconds (default `2`,
+   - **Timeout (Seconds)**: How long to wait for an answer (default `300`,
+     minimum `1`)
+   - **Poll Interval (Seconds)**: How often to check for the answer (default `2`,
      minimum `2`)
 
 #### Output
@@ -75,8 +102,19 @@ The node returns a JSON object with:
 | `agentId` | Agent used, or `null` |
 | `sqlMode` | Whether SQL mode was requested |
 
-If **Continue On Fail** is enabled, failures produce `{ "success": false, "error": "..." }`
-for the affected item instead of stopping the workflow.
+If **Continue On Fail** is enabled, a failure produces an item instead of stopping the
+workflow:
+
+| Field | Description |
+| --- | --- |
+| `success` | Always `false` on this path |
+| `error` | Summary of what went wrong |
+| `description` | Remediation hint, or `null` |
+| `conversationId` | Conversation the failure belongs to, or `null` — use it to retry or inspect the run |
+| `backendMessage` | Diagnostic text reported by Draiven, or `null` |
+
+`conversationId` is populated even on timeout, so a downstream branch can retrieve a
+late answer rather than losing the run.
 
 #### Continuing a conversation
 
@@ -179,6 +217,16 @@ npm run dev
 - Added **SQL Mode**, **Timeout** and **Poll Interval** options.
 - Backend orchestration failures now fail the item instead of returning an error
   string as the answer.
+- Node errors no longer carry the originating request, so credentials and
+  authorization headers cannot reach n8n execution logs.
+- **Timeout**, **Poll Interval** and **Conversation ID** are validated as whole
+  numbers and rejected with a clear message instead of failing mid-request.
+- Requests are bounded by a per-request timeout as well as the overall run
+  timeout, so a stalled connection can no longer hang the workflow.
+- The credential test rejects non-HTTP(S) API URLs and URLs carrying embedded
+  `user:pass@` credentials.
+- **Continue On Fail** items now carry `description`, `conversationId` and
+  `backendMessage` alongside `error`.
 - Removed the `@microsoft/signalr` dependency.
 
 ### 0.1.0 (2026-01-29)

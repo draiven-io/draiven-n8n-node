@@ -3,6 +3,22 @@ import { aiMessage, BASE_URL, httpError, makeContext } from './helpers';
 
 type Call = [string, { method: string; url: string; body?: Record<string, unknown>; headers?: Record<string, string> }];
 
+/**
+ * Await a call that must reject and hand back the error it rejected with.
+ *
+ * Using `.catch((e) => e)` widens the type to `Result | Error`, and a bare
+ * `rejects.toThrow` cannot inspect several fields at once. This also fails
+ * loudly if the call unexpectedly succeeds.
+ */
+async function rejection(promise: Promise<unknown>): Promise<Error & Record<string, unknown>> {
+	try {
+		await promise;
+	} catch (error) {
+		return error as Error & Record<string, unknown>;
+	}
+	throw new Error('Expected the call to reject, but it resolved.');
+}
+
 describe('Draiven node execute', () => {
 	beforeEach(() => {
 		jest.useFakeTimers();
@@ -192,6 +208,153 @@ describe('Draiven node execute', () => {
 	it('fails clearly when the submit response carries no conversation ID', async () => {
 		const request = jest.fn().mockResolvedValueOnce({ status: 'processing' });
 
-		await expect(run(request, baseParams)).rejects.toThrow(/no conversation ID/i);
+		await expect(run(request, baseParams)).rejects.toThrow(/no usable conversation ID/i);
+	});
+
+	// The ID is interpolated straight into the poll URL, so anything that is not
+	// a positive integer builds a path that can never resolve and the node would
+	// otherwise burn its whole timeout budget on 404s.
+	it.each([
+		['a float', 4.5],
+		['zero', 0],
+		['a negative number', -3],
+		['a non-numeric value', 'abc'],
+	])('rejects %s as a conversation ID', async (_label, conversationId) => {
+		const request = jest.fn().mockResolvedValueOnce({ conversation_id: conversationId });
+
+		await expect(run(request, baseParams)).rejects.toThrow(/no usable conversation ID/i);
+		expect(request).toHaveBeenCalledTimes(1);
+	});
+
+	// `minValue` in the editor is advisory only -- these fields accept
+	// expressions, so a float, a string or NaN can reach the node and would
+	// otherwise be coerced into a nonsensical deadline.
+	it.each([
+		['Timeout (Seconds)', { timeout: '30 seconds' }],
+		['Timeout (Seconds)', { timeout: 1.5 }],
+		['Poll Interval (Seconds)', { pollInterval: 0 }],
+		['Conversation ID', { conversationId: 4.2 }],
+		['Conversation ID', { conversationId: -1 }],
+	])('rejects an invalid %s option before calling the API', async (name, options) => {
+		const request = jest.fn();
+
+		const thrown = await rejection(run(request, { ...baseParams, options }));
+
+		expect(thrown.message).toContain(name);
+		expect(thrown.message).toMatch(/must be a whole number/i);
+		expect(request).not.toHaveBeenCalled();
+	});
+
+	describe('when the backend reports an error message', () => {
+		const backendText = 'Query failed: column "revenu" does not exist in table finance.sales';
+
+		const failingRequest = () =>
+			jest
+				.fn()
+				.mockResolvedValueOnce(submitOk)
+				.mockResolvedValueOnce(
+					aiMessage(7, { content: backendText, additional_data: { error: true } }),
+				);
+
+		// The thrown error reaches editor toasts and workflow logs, which are
+		// shared far more widely than the item output.
+		it('keeps the raw backend text out of the thrown error', async () => {
+			const thrown = await rejection(run(failingRequest(), baseParams));
+
+			expect(thrown.message).toMatch(/failed to answer the question/i);
+			expect(thrown.message).not.toContain(backendText);
+			expect(String(thrown.description ?? '')).not.toContain(backendText);
+		});
+
+		// A Continue On Fail branch cannot route or retry on "success: false"
+		// alone -- it needs to know which conversation failed and why.
+		it('keeps the diagnostics on the failed item', async () => {
+			const result = await run(failingRequest(), baseParams, { continueOnFail: true });
+
+			expect(result[0][0].json).toMatchObject({
+				success: false,
+				conversationId: 42,
+				backendMessage: backendText,
+			});
+			expect(result[0][0].json.description).toEqual(expect.stringContaining('conversation 42'));
+			expect(result[0][0].pairedItem).toEqual({ item: 0 });
+		});
+	});
+
+	it('records the conversation ID on the failed item even when polling times out', async () => {
+		const request = jest.fn().mockResolvedValueOnce(submitOk).mockResolvedValue(null);
+
+		const result = await run(request, { ...baseParams, options: { timeout: 5 } }, { continueOnFail: true });
+
+		expect(result[0][0].json).toMatchObject({ success: false, conversationId: 42 });
+		expect(result[0][0].json.error).toMatch(/did not return an answer/i);
+	});
+});
+
+describe('Draiven node loadOptions', () => {
+	const cases = [
+		{ method: 'getDatasets' as const, path: '/datasets/', context: /dataset list/i },
+		{ method: 'getAgents' as const, path: '/agents/', context: /agent list/i },
+	];
+
+	describe.each(cases)('$method', ({ method, path, context }) => {
+		const load = (request: jest.Mock, extra: { apiUrl?: unknown } = {}) => {
+			const ctx = makeContext({ request, ...extra });
+			return new Draiven().methods.loadOptions[method].call(ctx as never);
+		};
+
+		// A missing trailing slash makes the backend answer with a redirect,
+		// which drops the Authorization header on the follow-up request.
+		it(`requests ${path} with its trailing slash`, async () => {
+			const request = jest.fn().mockResolvedValue([]);
+
+			await load(request);
+
+			const [credentialType, options] = request.mock.calls[0] as Call;
+			expect(credentialType).toBe('draivenApi');
+			expect(options.method).toBe('GET');
+			expect(options.url).toBe(`${BASE_URL}${path}`);
+		});
+
+		it('maps each entry to a name/value pair for the dropdown', async () => {
+			const request = jest.fn().mockResolvedValue([
+				{ id: 1, name: 'Alpha', description: 'first' },
+				{ id: 2, name: 'Beta' },
+			]);
+
+			await expect(load(request)).resolves.toEqual([
+				{ name: 'Alpha', value: 1, description: 'first' },
+				{ name: 'Beta', value: 2, description: undefined },
+			]);
+		});
+
+		// An error payload or a paginated envelope must render as an empty
+		// dropdown rather than throwing inside the editor.
+		it.each([
+			['an empty list', []],
+			['null', null],
+			['an object envelope', { items: [] }],
+			['a string', 'unexpected'],
+		])('returns no options for %s', async (_label, payload) => {
+			const request = jest.fn().mockResolvedValue(payload);
+
+			await expect(load(request)).resolves.toEqual([]);
+		});
+
+		it('normalizes a provider failure into an actionable message', async () => {
+			const request = jest.fn().mockRejectedValue(httpError(401, 'Request failed', 'wrapped'));
+
+			const thrown = await rejection(load(request));
+
+			expect(thrown.message).toMatch(/rejected the credentials/i);
+			expect(thrown.message).toMatch(context);
+		});
+
+		it('rejects an invalid API URL before calling the API', async () => {
+			const request = jest.fn();
+
+			await expect(load(request, { apiUrl: 'not-a-url' })).rejects.toThrow(/not a valid URL/i);
+			expect(request).not.toHaveBeenCalled();
+		});
 	});
 });

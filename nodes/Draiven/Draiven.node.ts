@@ -2,6 +2,7 @@ import type {
 	IDataObject,
 	IExecuteFunctions,
 	ILoadOptionsFunctions,
+	INode,
 	INodeExecutionData,
 	INodePropertyOptions,
 	INodeType,
@@ -29,6 +30,40 @@ interface AskQuestionOptions {
 
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const DEFAULT_POLL_INTERVAL_SECONDS = 2;
+
+/**
+ * Read an optional whole-number node option, failing loudly on bad input.
+ *
+ * The editor's `minValue` is a UI affordance only: a `type: 'number'` field can
+ * be driven by an expression, so these values can arrive as a float, a numeric
+ * string, or `NaN`. Clamping silently (`Math.max(NaN, 1)` yields `NaN`) would
+ * hand a nonsensical deadline to the poll loop and surface later as a confusing
+ * timeout, so an invalid value is rejected here with the offending input named.
+ */
+function readIntegerOption(
+	node: INode,
+	value: unknown,
+	config: { name: string; min: number; fallback: number; itemIndex: number },
+): number {
+	if (value === undefined || value === null || value === '') {
+		return config.fallback;
+	}
+
+	const parsed = typeof value === 'string' ? Number(value.trim()) : value;
+
+	if (typeof parsed !== 'number' || !Number.isInteger(parsed) || parsed < config.min) {
+		throw new NodeOperationError(
+			node,
+			`The "${config.name}" option must be a whole number of at least ${config.min}.`,
+			{
+				description: `Received ${JSON.stringify(value)}.`,
+				itemIndex: config.itemIndex,
+			},
+		);
+	}
+
+	return parsed;
+}
 
 export class Draiven implements INodeType {
 	description: INodeTypeDescription = {
@@ -219,6 +254,11 @@ export class Draiven implements INodeType {
 		const node = this.getNode();
 
 		for (let i = 0; i < items.length; i++) {
+			// Hoisted so the Continue On Fail branch can still report which
+			// conversation failed and what the backend said about it.
+			let conversationId: number | undefined;
+			let backendDiagnostic: string | undefined;
+
 			try {
 				const operation = this.getNodeParameter('operation', i) as string;
 
@@ -244,11 +284,31 @@ export class Draiven implements INodeType {
 				const rawAgentId = this.getNodeParameter('agentId', i, '') as number | string;
 				const options = this.getNodeParameter('options', i, {}) as AskQuestionOptions;
 
-				const timeoutMs = Math.max(options.timeout ?? DEFAULT_TIMEOUT_SECONDS, 1) * 1000;
+				const timeoutMs =
+					readIntegerOption(node, options.timeout, {
+						name: 'Timeout (Seconds)',
+						min: 1,
+						fallback: DEFAULT_TIMEOUT_SECONDS,
+						itemIndex: i,
+					}) * 1000;
+
 				const pollIntervalMs = Math.max(
-					(options.pollInterval ?? DEFAULT_POLL_INTERVAL_SECONDS) * 1000,
+					readIntegerOption(node, options.pollInterval, {
+						name: 'Poll Interval (Seconds)',
+						min: 1,
+						fallback: DEFAULT_POLL_INTERVAL_SECONDS,
+						itemIndex: i,
+					}) * 1000,
 					MIN_POLL_INTERVAL_MS,
 				);
+
+				// 0 is the documented "start a new conversation" sentinel.
+				const conversationIdOption = readIntegerOption(node, options.conversationId, {
+					name: 'Conversation ID',
+					min: 0,
+					fallback: 0,
+					itemIndex: i,
+				});
 
 				const body: IDataObject = {
 					question,
@@ -268,9 +328,7 @@ export class Draiven implements INodeType {
 				// already the "last AI message". Capture that id *before* submitting
 				// so the poll loop can tell the old answer from the new one.
 				const continuedConversationId =
-					typeof options.conversationId === 'number' && options.conversationId > 0
-						? options.conversationId
-						: undefined;
+					conversationIdOption > 0 ? conversationIdOption : undefined;
 
 				let baselineMessageId: number | null = null;
 				if (continuedConversationId !== undefined) {
@@ -300,13 +358,18 @@ export class Draiven implements INodeType {
 					throw toDraivenError(node, error, 'submitting the question to Draiven');
 				}
 
-				const conversationId = Number(submitted?.conversation_id ?? submitted?.id);
-				if (!Number.isFinite(conversationId)) {
+				conversationId = Number(submitted?.conversation_id ?? submitted?.id);
+
+				// Must be a positive integer: it is interpolated straight into the
+				// poll URL, and a float, 0 or a negative value would build a path
+				// that can never resolve.
+				if (!Number.isInteger(conversationId) || conversationId <= 0) {
 					throw new NodeOperationError(
 						node,
-						'Draiven accepted the question but returned no conversation ID.',
+						'Draiven accepted the question but returned no usable conversation ID.',
 						{
-							description: 'The answer cannot be polled without a conversation ID. Retry the request.',
+							description:
+								'Polling requires a positive whole-number conversation ID. Retry the request; if it persists, contact Draiven support.',
 							itemIndex: i,
 						},
 					);
@@ -323,8 +386,12 @@ export class Draiven implements INodeType {
 				// `additional_data.error` so pollers stop waiting. It is a failure
 				// report, not an answer, and must not be returned as success.
 				if (isErrorMessage(message)) {
+					// The raw content is customer-facing analysis text and is kept
+					// out of the node error, which surfaces in logs and the editor.
+					// It is carried on the output item instead.
+					backendDiagnostic = message.content;
 					throw new NodeOperationError(node, 'Draiven failed to answer the question.', {
-						description: `The Draiven orchestration reported an error for conversation ${conversationId}. Backend message: "${message.content}"`,
+						description: `The Draiven orchestration reported an error for conversation ${conversationId}. With "Continue On Fail" enabled, the backend's diagnostic text is returned as "backendMessage" on the output item.`,
 						itemIndex: i,
 					});
 				}
@@ -349,10 +416,18 @@ export class Draiven implements INodeType {
 				});
 			} catch (error) {
 				if (this.continueOnFail()) {
+					// Preserve the diagnostics a downstream branch needs to act on:
+					// the remediation hint, the conversation to retry or inspect,
+					// and whatever the backend reported.
+					const description = (error as { description?: unknown })?.description;
+
 					returnData.push({
 						json: {
 							success: false,
 							error: error instanceof Error ? error.message : String(error),
+							description: typeof description === 'string' ? description : null,
+							conversationId: conversationId ?? null,
+							backendMessage: backendDiagnostic ?? null,
 						},
 						pairedItem: { item: i },
 					});

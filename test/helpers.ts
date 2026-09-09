@@ -1,6 +1,33 @@
-import type { INode } from 'n8n-workflow';
+import type { INode, JsonObject } from 'n8n-workflow';
+import { NodeApiError } from 'n8n-workflow';
 
 export const BASE_URL = 'https://api.draiven.io';
+
+/**
+ * The secret embedded in every error fixture's request config.
+ *
+ * Real provider errors carry the outbound request config, which includes the
+ * `Authorization` header n8n built from the API key. Tests assert this string
+ * never survives into anything the operator or the logs can see.
+ */
+export const CREDENTIAL_SECRET = 'super-secret-api-key';
+const AUTH_HEADER = `Basic ${Buffer.from(`user@example.com:${CREDENTIAL_SECRET}`).toString('base64')}`;
+
+/**
+ * The two shapes an error can have by the time node code sees it.
+ *
+ * `raw`     - the axios-style rejection a bare HTTP client throws.
+ * `wrapped` - what n8n-core actually delivers in production: every transport
+ *             failure is re-thrown as `new NodeApiError(this.getNode(), error)`
+ *             before the node's catch block runs
+ *             (n8n-core/dist/execution-engine/node-execution-context/utils/
+ *             request-helper-functions.js:998).
+ *
+ * Suites run against both so a guard that only holds for hand-built fixtures
+ * cannot pass while being wrong in production.
+ */
+export type ErrorShape = 'raw' | 'wrapped';
+export const ERROR_SHAPES: readonly ErrorShape[] = ['raw', 'wrapped'];
 
 export function makeNode(): INode {
 	return {
@@ -13,17 +40,70 @@ export function makeNode(): INode {
 	};
 }
 
-/** An error shaped like the ones n8n's httpRequest helper throws. */
-export function httpError(status: number, message = 'Request failed'): Error {
-	const error = new Error(message) as Error & { statusCode: number; response: { status: number } };
+/**
+ * An error shaped like the ones n8n's httpRequest helper throws.
+ *
+ * Carries the request config -- including the Basic auth header -- exactly as
+ * a real axios rejection does, so leak assertions have something to catch.
+ */
+export function httpError(status: number, message = 'Request failed', shape: ErrorShape = 'raw'): Error {
+	const error = new Error(message) as Error & Record<string, unknown>;
+	error.isAxiosError = true;
 	error.statusCode = status;
-	error.response = { status };
-	return error;
+	error.status = status;
+	error.response = { status, statusCode: status, data: { detail: message } };
+	error.config = {
+		url: `${BASE_URL}/conversations/`,
+		headers: { Authorization: AUTH_HEADER },
+	};
+
+	if (shape === 'raw') return error;
+	return new NodeApiError(makeNode(), error as unknown as JsonObject);
 }
 
 /** A transport-level failure, which carries no HTTP status. */
-export function networkError(message = 'ECONNRESET'): Error {
-	return new Error(message);
+export function networkError(message = 'ECONNRESET', shape: ErrorShape = 'raw'): Error {
+	const error = new Error(message) as Error & Record<string, unknown>;
+	error.isAxiosError = true;
+	error.code = message;
+	error.config = {
+		url: `${BASE_URL}/conversations/`,
+		headers: { Authorization: AUTH_HEADER },
+	};
+
+	if (shape === 'raw') return error;
+	return new NodeApiError(makeNode(), error as unknown as JsonObject);
+}
+
+/**
+ * Every value reachable from an error by walking own enumerable properties.
+ *
+ * `JSON.stringify` is not sufficient on its own: `Error` defines `toJSON`, so
+ * stringifying only reports the fields n8n chose to serialize and would hide a
+ * secret retained on `cause` or `errorResponse`. This walks the real object
+ * graph, so a credential retained anywhere on the error is caught.
+ */
+export function reachableText(value: unknown, seen = new Set<unknown>()): string {
+	if (value === null || value === undefined) return '';
+	if (typeof value === 'string') return value;
+	if (typeof value !== 'object') return String(value);
+	if (seen.has(value)) return '';
+	seen.add(value);
+
+	const parts: string[] = [];
+	if (value instanceof Error) {
+		parts.push(value.message, value.stack ?? '');
+	}
+	for (const key of Object.getOwnPropertyNames(value)) {
+		let inner: unknown;
+		try {
+			inner = (value as Record<string, unknown>)[key];
+		} catch {
+			continue;
+		}
+		parts.push(key, reachableText(inner, seen));
+	}
+	return parts.join(' ');
 }
 
 export interface MockContextOptions {

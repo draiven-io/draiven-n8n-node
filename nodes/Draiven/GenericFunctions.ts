@@ -32,6 +32,50 @@ export const MAX_TRANSIENT_FAILURES = 5;
  */
 export const MAX_BACKOFF_MS = 30_000;
 
+/**
+ * Ceiling for a single HTTP request, in milliseconds.
+ *
+ * Without it, a connection that opens and then stalls never rejects, so the
+ * poll loop's deadline check is never reached again and the node hangs well
+ * past the user's configured timeout.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Marks an error as already shaped by this module.
+ *
+ * Defined non-enumerably so it never reaches n8n's execution data or any log
+ * line, and keyed off a symbol so it cannot collide with provider payloads.
+ */
+const DRAIVEN_SHAPED_ERROR = Symbol.for('draiven.shapedError');
+
+/** Tag an error as ours, so `toDraivenError` will not re-wrap it. */
+function markShaped<E extends Error>(error: E): E {
+	Object.defineProperty(error, DRAIVEN_SHAPED_ERROR, {
+		value: true,
+		enumerable: false,
+		writable: false,
+		configurable: false,
+	});
+	return error;
+}
+
+/**
+ * True only for errors this module produced.
+ *
+ * Deliberately *not* an `instanceof NodeApiError` check: n8n-core wraps every
+ * transport failure in a `NodeApiError` before we ever see it, so keying off
+ * the class would short-circuit classification for real provider errors and
+ * hand the operator n8n's generic text instead of an actionable message.
+ */
+export function isDraivenShapedError(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as Record<symbol, unknown>)[DRAIVEN_SHAPED_ERROR] === true
+	);
+}
+
 /** Shape returned by `POST /conversations/`. */
 export interface ConversationSubmitResponse {
 	id: number;
@@ -154,13 +198,15 @@ export function extractStatusCode(error: unknown): number | undefined {
  * "the node failed and here is what to do about it".
  */
 export function toDraivenError(node: INode, error: unknown, context: string): Error {
-	// Never re-wrap an error we already shaped: doing so would bury the message.
-	if (error instanceof NodeOperationError || error instanceof NodeApiError) {
-		return error;
+	// Short-circuit only on errors we produced ourselves: our own classified
+	// API errors, and our own validation/timeout throws. Anything else --
+	// including the NodeApiError that n8n-core throws for every transport
+	// failure -- must fall through and be classified.
+	if (isDraivenShapedError(error) || error instanceof NodeOperationError) {
+		return error as Error;
 	}
 
 	const status = extractStatusCode(error);
-	const asJson = (error ?? {}) as JsonObject;
 
 	let message: string;
 	let description: string;
@@ -194,11 +240,26 @@ export function toDraivenError(node: INode, error: unknown, context: string): Er
 				'Check that the API URL is reachable from this n8n instance and that the network path allows outbound HTTPS.';
 	}
 
-	return new NodeApiError(node, asJson, {
-		message,
-		description,
-		httpCode: status !== undefined ? String(status) : undefined,
-	});
+	// Build the error from a plain object holding only text we wrote ourselves.
+	//
+	// The original error is deliberately discarded rather than forwarded: n8n
+	// retains whatever is handed to `NodeApiError` (as `cause` for Error-shaped
+	// input, as `errorResponse` for object-shaped input), and a provider error
+	// carries the request config -- including the `Authorization: Basic ...`
+	// header built from the API key. Passing it through in any form would keep
+	// that credential attached to the error object.
+	const safeResponse: JsonObject = { message };
+	if (status !== undefined) {
+		safeResponse.httpCode = String(status);
+	}
+
+	return markShaped(
+		new NodeApiError(node, safeResponse, {
+			message,
+			description,
+			httpCode: status !== undefined ? String(status) : undefined,
+		}),
+	);
 }
 
 /**
@@ -233,12 +294,16 @@ export async function draivenApiRequest<T = unknown>(
 	baseUrl: string,
 	path: string,
 	body?: IDataObject,
+	timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<T> {
 	const options: IHttpRequestOptions = {
 		method,
 		url: `${baseUrl}${path}`,
 		headers: { 'Content-Type': 'application/json' },
 		json: true,
+		// Floored at 1ms on purpose: the underlying HTTP client treats 0 as
+		// "no timeout", which is precisely the hang this guards against.
+		timeout: Math.max(1, Math.floor(timeoutMs)),
 	};
 
 	if (body !== undefined) {
@@ -259,12 +324,15 @@ export async function fetchLastAiMessage(
 	ctx: DraivenContext,
 	baseUrl: string,
 	conversationId: number,
+	timeoutMs?: number,
 ): Promise<ConversationMessage | null> {
 	const response = await draivenApiRequest<ConversationMessage | null>(
 		ctx,
 		'GET',
 		baseUrl,
 		`/conversations/${conversationId}/last-ai-message`,
+		undefined,
+		timeoutMs,
 	);
 
 	return response ?? null;
@@ -312,9 +380,20 @@ export async function pollForAnswer(
 		const remaining = deadline - Date.now();
 		await sleep(Math.min(pollIntervalMs, Math.max(remaining, 0)));
 
+		// The sleep above can consume the entire remaining budget. Without this
+		// check the loop would issue one more request after the deadline had
+		// already passed, and that request could then hang unbounded.
+		const budget = deadline - Date.now();
+		if (budget <= 0) break;
+
 		let message: ConversationMessage | null;
 		try {
-			message = await fetchLastAiMessage(ctx, baseUrl, conversationId);
+			message = await fetchLastAiMessage(
+				ctx,
+				baseUrl,
+				conversationId,
+				Math.min(budget, DEFAULT_REQUEST_TIMEOUT_MS),
+			);
 			consecutiveFailures = 0;
 		} catch (error) {
 			if (!isTransientError(error)) {
