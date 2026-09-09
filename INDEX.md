@@ -1,3 +1,8 @@
+> **⚠️ Outdated (as of v0.3.0).**
+> This document describes the removed SignalR streaming and persona-based flow.
+> The node now uses the Conversations REST API with agent selection.
+> See [README.md](./README.md) for current behavior. Rewrite tracked as follow-up.
+
 # 📚 Draiven n8n Node - Documentation Index
 
 Welcome! This directory contains a complete n8n community node for integrating Draiven AI into your workflows.
