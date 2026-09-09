@@ -205,6 +205,17 @@ describe('Draiven node execute', () => {
 		expect(request).not.toHaveBeenCalled();
 	});
 
+	it('rejects an empty dataset ID instead of substituting a phantom 0', async () => {
+		const request = jest.fn();
+
+		// `"4,,7".split(',')` is an ordinary expression result. An empty slot is
+		// malformed input, not an unset option, so it must not become a real ID.
+		await expect(run(request, { ...baseParams, datasetIds: ['4', '', '7'] })).rejects.toThrow(
+			/Dataset ID at position 2/,
+		);
+		expect(request).not.toHaveBeenCalled();
+	});
+
 	it('rejects an invalid API URL before calling the API', async () => {
 		const request = jest.fn();
 
@@ -359,7 +370,7 @@ describe('Draiven node loadOptions', () => {
 			expect(thrown.message).toMatch(context);
 		});
 
-		it('rejects an invalid API URL before calling the API', async () => {
+	it('rejects an invalid API URL before calling the API', async () => {
 			const request = jest.fn();
 
 			await expect(load(request, { apiUrl: 'not-a-url' })).rejects.toThrow(/not a valid URL/i);

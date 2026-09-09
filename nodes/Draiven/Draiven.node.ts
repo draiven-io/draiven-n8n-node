@@ -43,13 +43,19 @@ const DEFAULT_POLL_INTERVAL_SECONDS = 2;
 function readIntegerOption(
 	node: INode,
 	value: unknown,
-	config: { name: string; min: number; fallback: number; itemIndex: number },
+	config: { name: string; min: number; fallback?: number; itemIndex: number },
 ): number {
-	if (value === undefined || value === null || value === '') {
+	const isEmpty = value === undefined || value === null || value === '';
+
+	// A fallback means "this option may be left unset". Callers that omit it --
+	// notably array *elements*, where an empty slot is malformed input rather
+	// than an absent option -- fall through to validation and throw, instead of
+	// silently substituting a value the user never asked for.
+	if (isEmpty && config.fallback !== undefined) {
 		return config.fallback;
 	}
 
-	const parsed = typeof value === 'string' ? Number(value.trim()) : value;
+	const parsed = isEmpty ? Number.NaN : typeof value === 'string' ? Number(value.trim()) : value;
 
 	if (typeof parsed !== 'number' || !Number.isInteger(parsed) || parsed < config.min) {
 		const received = JSON.stringify(value);
@@ -284,7 +290,6 @@ export class Draiven implements INodeType {
 						readIntegerOption(node, raw, {
 							name: `Dataset ID at position ${index + 1}`,
 							min: 1,
-							fallback: 0,
 							itemIndex: i,
 						}),
 				);
